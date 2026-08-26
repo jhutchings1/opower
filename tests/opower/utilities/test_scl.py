@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
-from opower.utilities.helpers import get_form_action_url_and_hidden_inputs
-from opower.utilities.scl import SCL, _get_session_storage_values, _get_user_token_from_url
+from opower2.utilities.helpers import get_form_action_url_and_hidden_inputs
+from opower2.utilities.scl import SCL, _get_session_storage_values, _get_user_token_from_url
 
 SSOLOGIN_HTML_FILENAME = os.path.join(os.path.dirname(__file__), "scl/ssologin_response.html")
 LOGIN_PAGE_HTML_FILENAME = os.path.join(os.path.dirname(__file__), "scl/login_page.html")

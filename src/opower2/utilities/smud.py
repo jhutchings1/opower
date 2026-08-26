@@ -29,7 +29,7 @@ from aiohttp import ClientResponse, ClientSession
 from aiohttp.client_exceptions import ClientResponseError
 from yarl import URL
 
-import opower
+import opower2 as opower
 
 from ..const import USER_AGENT
 from .base import UtilityBase

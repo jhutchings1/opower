@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import pytest
 
-from opower import (
+from opower2 import (
     Account,
     AggregateType,
     MeterType,
@@ -17,11 +17,11 @@ from opower import (
     create_cookie_jar,
     get_supported_utilities,
 )
-from opower.exceptions import ApiException, InvalidAuth
-from opower.opower import Customer
+from opower2.exceptions import ApiException, InvalidAuth
+from opower2.opower import Customer
 
 if TYPE_CHECKING:
-    from opower.utilities import UtilityBase
+    from opower2.utilities import UtilityBase
 
 
 @pytest.mark.parametrize("utility", get_supported_utilities())

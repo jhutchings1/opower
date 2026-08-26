@@ -6,7 +6,7 @@ import unittest
 import aiohttp
 from dotenv import load_dotenv
 
-from opower.utilities.clarkpublicutilities import ClarkPublicUtilities
+from opower2.utilities.clarkpublicutilities import ClarkPublicUtilities
 
 ENV_SECRET_PATH = os.path.join(os.path.dirname(__file__), "../../../.env.secret")
 

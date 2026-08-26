@@ -11,7 +11,7 @@ from getpass import getpass
 
 import aiohttp
 
-from opower import (
+from opower2 import (
     AggregateType,
     InvalidAuth,
     MfaChallenge,

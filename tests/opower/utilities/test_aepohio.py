@@ -7,7 +7,7 @@ import aiohttp
 from dotenv import load_dotenv
 from yarl import URL
 
-from opower.utilities.aepohio import AEPOHio
+from opower2.utilities.aepohio import AEPOHio
 
 ENV_SECRET_PATH = os.path.join(os.path.dirname(__file__), "../../../.env.secret")
 

@@ -7,7 +7,7 @@ import aiohttp
 from dotenv import load_dotenv
 from yarl import URL
 
-from opower.utilities.smud import (
+from opower2.utilities.smud import (
     SMUD,
     SMUDLoginParser,
     SMUDOktaResponseSamlResponseValueParser,
