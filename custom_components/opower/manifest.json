@@ -1,0 +1,13 @@
+{
+  "domain": "opower",
+  "name": "Opower",
+  "version": "0.0.1",
+  "codeowners": ["@tronikos"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://www.home-assistant.io/integrations/opower",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["opower2"],
+  "requirements": ["opower2 @ git+https://github.com/jhutchings1/opower@opower2-test"]
+}
