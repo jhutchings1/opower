@@ -16,7 +16,7 @@ from ..const import USER_AGENT
 from ..exceptions import CannotConnect, InvalidAuth, MfaChallenge
 from .base import MfaHandlerBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _load_javascript(text: str, var: str) -> dict[str, Any] | None:

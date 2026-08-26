@@ -11,7 +11,7 @@ from ..const import USER_AGENT
 from ..exceptions import InvalidAuth
 from .base import UtilityBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 class EvergyDavinciWidgetParser(HTMLParser):

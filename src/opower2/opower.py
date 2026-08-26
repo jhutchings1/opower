@@ -18,7 +18,7 @@ from .const import USER_AGENT
 from .exceptions import ApiException, CannotConnect, InvalidAuth
 from .utilities import UtilityBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _parse_read_time(value: str, tz: ZoneInfo) -> datetime:

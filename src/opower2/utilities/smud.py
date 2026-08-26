@@ -34,7 +34,7 @@ import opower2 as opower
 from ..const import USER_AGENT
 from .base import UtilityBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 class SMUDLoginParser(HTMLParser):
