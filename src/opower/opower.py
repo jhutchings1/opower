@@ -137,10 +137,152 @@ _DSS_SERVICE_TYPE_TO_METER = {
 }
 
 
+# Bill-level cost and usage query used as a fallback for utilities (e.g. PSE)
+# whose DataBrowser-v1 cost endpoint authenticates but never returns cost data.
+# billingAccountByAuthContext resolves the account from the bearer token and the
+# Opower-Selected-Entities header; some deployments additionally require an
+# explicit selectedAccount URN.
+_GRAPHQL_BILL_COST_QUERY = """
+query WDB_GetCostUsageReadsForBills(
+  $selectedAccount: ID
+  $customerURN: ID
+  $last: Int
+  $timeInterval: TimeInterval
+  $forceLegacyData: Boolean
+  $aliased: Boolean
+) {
+  billingAccountByAuthContext(
+    selectedAccount: $selectedAccount
+    singlePremise: $customerURN
+    forceLegacyData: $forceLegacyData
+  ) {
+    urn
+    bills(last: $last, during: $timeInterval, orderBy: ASCENDING, preserveDuplicateSegments: true) {
+      urn
+      timeInterval
+      segments {
+        urn
+        usageInterval
+        estimated
+        serviceAgreement(aliased: $aliased) { urn uuid serviceType }
+        serviceQuantities {
+          unit
+          serviceQuantityIdentifier
+          utilityServiceQuantityIdentifier
+          serviceQuantity { value }
+        }
+        usageCharges { value }
+        currentAmount { value }
+        deferredNEMCharges { value }
+        totalNEMCharges { value }
+        energyPurchased { value }
+        energySold { value }
+        rolloverBalanceEarned { value }
+        rolloverBalanceUsed { value }
+        totalEnergyCosts { value }
+      }
+    }
+  }
+}
+"""
+
+
 def _get_value(data: dict[str, Any] | None, key: str = "value", default: float = 0) -> float:
     """Extract `key` from a dict, returning default if missing or None."""
     val = (data or {}).get(key)
     return float(val) if val is not None else default
+
+
+# serviceQuantityIdentifier values that represent metered consumption. PSE returns
+# NET_USAGE (which can be negative when an account exports more than it imports).
+_GRAPHQL_USAGE_IDENTIFIERS = {"NET_USAGE", "CONSUMPTION", "USAGE"}
+
+
+def _graphql_segment_matches_account(segment: dict[str, Any], account: "Account") -> bool:
+    """Return True if a WDB bill segment belongs to the given account.
+
+    Prefer the serviceAgreement uuid; fall back to the uuid embedded in its urn
+    (``:uuid:<account uuid>``) and finally to mapping serviceType to a meter type.
+    """
+    service_agreement = segment.get("serviceAgreement") or {}
+    uuid = service_agreement.get("uuid")
+    if uuid:
+        return str(uuid) == account.uuid
+    urn = str(service_agreement.get("urn", ""))
+    marker = ":uuid:"
+    if marker in urn:
+        return urn.rsplit(marker, 1)[-1] == account.uuid
+    service_type = str(service_agreement.get("serviceType", "")).upper()
+    return _DSS_SERVICE_TYPE_TO_METER.get(service_type) == account.meter_type.value
+
+
+def _graphql_bill_segment_read(
+    bill: dict[str, Any],
+    segment: dict[str, Any],
+    tz: ZoneInfo,
+    start: datetime,
+    end: datetime,
+) -> "CostRead | None":
+    """Convert one WDB_GetCostUsageReadsForBills segment to a CostRead.
+
+    Returns None when the segment has no parseable interval or falls entirely
+    outside the requested [start, end) window.
+    """
+    interval = segment.get("usageInterval") or bill.get("timeInterval") or ""
+    if "/" not in interval:
+        return None
+    start_str, end_str = interval.split("/", 1)
+    seg_start = _parse_read_time(start_str, tz)
+    seg_end = _parse_read_time(end_str, tz)
+    if seg_end <= start or seg_start >= end:
+        return None
+    # totalEnergyCosts is the NEM-aware per-segment total; usageCharges (== currentAmount
+    # in observed responses) is the fallback when the utility does not populate it.
+    cost = 0.0
+    for key in ("totalEnergyCosts", "usageCharges", "currentAmount"):
+        node = segment.get(key)
+        if node is not None and node.get("value") is not None:
+            cost = float(node["value"])
+            break
+    consumption = sum(
+        _get_value(quantity.get("serviceQuantity"))
+        for quantity in segment.get("serviceQuantities") or []
+        if str(quantity.get("serviceQuantityIdentifier", "")).upper() in _GRAPHQL_USAGE_IDENTIFIERS
+    )
+    return CostRead(start_time=seg_start, end_time=seg_end, consumption=consumption, provided_cost=cost)
+
+
+def _graphql_bills_to_cost_reads(
+    billing_account: dict[str, Any],
+    account: "Account",
+    tz: ZoneInfo,
+    start: datetime,
+    end: datetime,
+) -> "list[CostRead]":
+    """Merge WDB_GetCostUsageReadsForBills segments into sorted bill-level CostReads."""
+    reads_by_start: dict[datetime, CostRead] = {}
+    for bill in billing_account.get("bills") or []:
+        for segment in bill.get("segments") or []:
+            if not _graphql_segment_matches_account(segment, account):
+                continue
+            read = _graphql_bill_segment_read(bill, segment, tz, start, end)
+            if read is None:
+                continue
+            existing = reads_by_start.get(read.start_time)
+            if existing is None:
+                reads_by_start[read.start_time] = read
+            else:
+                existing.consumption += read.consumption
+                existing.provided_cost += read.provided_cost
+                existing.end_time = max(existing.end_time, read.end_time)
+    reads = [reads_by_start[key] for key in sorted(reads_by_start)]
+    # Remove trailing entries with no data (mirrors async_get_cost_reads).
+    while reads:
+        last = reads.pop()
+        if last.provided_cost != 0 or last.consumption != 0:
+            reads.append(last)
+            break
+    return reads
 
 
 @dataclasses.dataclass
@@ -540,6 +682,13 @@ class Opower:
             if aggregate_type != AggregateType.BILL and not usage_only:
                 _LOGGER.debug("Cost endpoint failed. Falling back to just usage data.")
                 return await self.async_get_cost_reads(account, aggregate_type, start_date, end_date, usage_only=True)
+            # Some utilities (e.g. PSE) never return bill cost from DataBrowser-v1.
+            # Fall back to bill-level cost from the GraphQL API.
+            if aggregate_type == AggregateType.BILL and not usage_only:
+                _LOGGER.debug("Bill cost endpoint failed. Falling back to GraphQL bill data.")
+                graphql_reads = await self._async_get_graphql_bill_cost_reads(account, start_date, end_date)
+                if graphql_reads:
+                    return graphql_reads
             raise
         tz = await aiozoneinfo.async_get_time_zone(self.utility.timezone())
         result: list[CostRead] = []
@@ -574,7 +723,75 @@ class Opower:
         if aggregate_type != AggregateType.BILL and not result and not usage_only:
             _LOGGER.debug("Got no usage/cost data. Falling back to just usage data.")
             return await self.async_get_cost_reads(account, aggregate_type, start_date, end_date, usage_only=True)
+        # Some utilities (e.g. PSE) authenticate against DataBrowser-v1 but it never
+        # returns cost, only zero-cost usage. Fall back to bill-level cost from GraphQL.
+        if (
+            aggregate_type == AggregateType.BILL
+            and not usage_only
+            and not any(read.provided_cost for read in result)
+        ):
+            _LOGGER.debug("No bill cost from cost endpoint. Falling back to GraphQL bill data.")
+            graphql_reads = await self._async_get_graphql_bill_cost_reads(account, start_date, end_date)
+            if graphql_reads:
+                return graphql_reads
         return result
+
+    async def _async_get_graphql_bill_cost_reads(
+        self,
+        account: Account,
+        start_date: datetime | None,
+        end_date: datetime | None,
+    ) -> list[CostRead]:
+        """Fetch bill-level cost and usage via the WDB_GetCostUsageReadsForBills query.
+
+        Fallback for utilities (e.g. PSE) whose DataBrowser-v1 cost endpoint returns
+        no cost data. Only BILL resolution is available through this path. Consumption
+        is the net usage the bill reports for this account's service agreement and can
+        be negative. The gas figure is in the utility's billing unit (therms for PSE)
+        which may differ from the unit used elsewhere in the library.
+        Returns an empty list (never raises) when GraphQL is unavailable.
+        """
+        tz = await aiozoneinfo.async_get_time_zone(self.utility.timezone())
+        end = end_date or datetime.now(tz)
+        # Bill history usually goes back further than the ~3 years of interval data.
+        start = start_date or (end - timedelta(days=365 * 12))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=tz)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=tz)
+
+        headers = self._get_headers(account.customer.uuid)
+        selected_account = f"urn:opower:v0:multiCustomer:{self.utility.subdomain()}:uuids:{account.customer.uuid}"
+        base_variables: dict[str, Any] = {
+            "timeInterval": f"{start.isoformat()}/{end.isoformat()}",
+            "last": 720,
+            "forceLegacyData": True,
+            "aliased": False,
+        }
+
+        result: Any = None
+        # Try with an explicit selectedAccount URN first, then fall back to letting
+        # billingAccountByAuthContext resolve the account from the auth context.
+        for variables in ({**base_variables, "selectedAccount": selected_account}, base_variables):
+            try:
+                result = await self._async_post_graphql(_GRAPHQL_BILL_COST_QUERY, headers, variables)
+                break
+            except ApiException as err:
+                _LOGGER.debug(
+                    "GraphQL bill cost query failed (with selectedAccount=%s): %s",
+                    "selectedAccount" in variables,
+                    err,
+                )
+        if result is None:
+            return []
+
+        billing_account = result.get("data", {}).get("billingAccountByAuthContext")
+        if isinstance(billing_account, list):
+            billing_account = billing_account[0] if billing_account else None
+        if not billing_account:
+            return []
+
+        return _graphql_bills_to_cost_reads(billing_account, account, tz, start, end)
 
     async def async_get_usage_reads(
         self,
@@ -843,15 +1060,20 @@ class Opower:
         except ClientError as e:
             raise ApiException(f"Client Error: {e}", url=full_url) from e
 
-    async def _async_post_graphql(self, query: str, headers: dict[str, str]) -> Any:
+    async def _async_post_graphql(
+        self, query: str, headers: dict[str, str], variables: dict[str, Any] | None = None
+    ) -> Any:
         """Execute a GraphQL query against the Opower API."""
         url = f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/dsm-graphql-v1/cws/graphql"
         _LOGGER.debug("GraphQL query to: %s", url)
+        body: dict[str, Any] = {"query": query}
+        if variables is not None:
+            body["variables"] = variables
         try:
             async with self.session.post(
                 url,
                 headers={**headers, "Content-Type": "application/json"},
-                json={"query": query},
+                json=body,
             ) as resp:
                 if not resp.ok:
                     raise ApiException(

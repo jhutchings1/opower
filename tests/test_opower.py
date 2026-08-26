@@ -18,6 +18,7 @@ from opower import (
     get_supported_utilities,
 )
 from opower.exceptions import ApiException, InvalidAuth
+from opower.opower import Customer
 
 if TYPE_CHECKING:
     from opower.utilities import UtilityBase
@@ -92,10 +93,10 @@ async def test_cost_reads_falls_back_to_usage_on_api_error(
 
 
 @pytest.mark.asyncio
-async def test_cost_reads_bill_does_not_fall_back(
+async def test_cost_reads_bill_raises_when_graphql_fallback_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bill-level cost endpoint errors should not fall back; they should raise."""
+    """A failing bill cost endpoint re-raises when the GraphQL fallback yields nothing."""
     async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
         opower = Opower(
             session,
@@ -105,7 +106,7 @@ async def test_cost_reads_bill_does_not_fall_back(
         )
 
         account = Account(
-            customer=Mock(),
+            customer=Customer(uuid="customer-uuid"),
             uuid="test-uuid",
             utility_account_id="test-id",
             id="test-id",
@@ -116,10 +117,250 @@ async def test_cost_reads_bill_does_not_fall_back(
         async def fake_get_dated_data(*args: object, **kwargs: object) -> list[object]:
             raise ApiException(message="HTTP Error: 500", url="http://example.com")
 
+        async def fake_post_graphql(*args: object, **kwargs: object) -> object:
+            raise ApiException(message="GraphQL Error", url="http://example.com")
+
         monkeypatch.setattr(opower, "_async_get_dated_data", fake_get_dated_data)
+        monkeypatch.setattr(opower, "_async_post_graphql", fake_post_graphql)
 
         with pytest.raises(ApiException):
             await opower.async_get_cost_reads(account, AggregateType.BILL, None, None)
+
+
+def _pse_bill(
+    interval: str,
+    elec_charge: float,
+    elec_usage: float,
+    gas_charge: float,
+    gas_usage: float,
+    elec_total_energy_cost: float | None = None,
+) -> dict[str, object]:
+    """Build a WDB_GetCostUsageReadsForBills bill with an electric and a gas segment."""
+
+    def _segment(
+        uuid: str, service_type: str, charge: float, usage: float, unit: str, total: float | None
+    ) -> dict[str, object]:
+        return {
+            "estimated": False,
+            "usageInterval": interval,
+            "usageCharges": {"value": charge},
+            "currentAmount": {"value": charge},
+            "deferredNEMCharges": None,
+            "totalNEMCharges": None,
+            "energyPurchased": None,
+            "energySold": None,
+            "rolloverBalanceEarned": None,
+            "rolloverBalanceUsed": None,
+            "totalEnergyCosts": {"value": total} if total is not None else None,
+            "serviceAgreement": {
+                "urn": f"urn:opower:v0:utilityAccount:pse:uuid:{uuid}",
+                "uuid": uuid,
+                "serviceType": service_type,
+            },
+            "serviceQuantities": [
+                {
+                    "unit": unit,
+                    "serviceQuantityIdentifier": "NET_USAGE",
+                    "utilityServiceQuantityIdentifier": None,
+                    "serviceQuantity": {"value": usage},
+                }
+            ],
+        }
+
+    return {
+        "timeInterval": interval,
+        "segments": [
+            _segment("elec-uuid", "ELECTRICITY", elec_charge, elec_usage, "KWH", elec_total_energy_cost),
+            _segment("gas-uuid", "GAS", gas_charge, gas_usage, "TH", None),
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_cost_reads_bill_falls_back_to_graphql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the cost endpoint returns nothing, bill cost comes from the WDB GraphQL query.
+
+    Mirrors utilities like PSE where DataBrowser-v1 authenticates but never
+    returns cost data. Only the segment matching the account's uuid is used, and
+    NET_USAGE can be negative for a period that exports more than it imports.
+    """
+    async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
+        opower = Opower(
+            session,
+            "Puget Sound Energy (PSE)",
+            username="test",
+            password="test",  # noqa: S106
+        )
+
+        account = Account(
+            customer=Customer(uuid="customer-uuid"),
+            uuid="elec-uuid",
+            utility_account_id="test-id",
+            id="test-id",
+            meter_type=MeterType.ELEC,
+            read_resolution=ReadResolution.BILLING,
+        )
+
+        async def fake_get_dated_data(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            return []
+
+        graphql_calls: list[dict[str, object]] = []
+
+        async def fake_post_graphql(
+            query: str,
+            headers: dict[str, str],
+            variables: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            graphql_calls.append(variables or {})
+            return {
+                "data": {
+                    "billingAccountByAuthContext": {
+                        "urn": "urn:opower:v0:multiCustomer:pse:uuids:customer-uuid",
+                        "bills": [
+                            _pse_bill(
+                                "2025-12-06T00:00:00-08:00/2026-01-06T00:00:00-08:00",
+                                elec_charge=302.19,
+                                elec_usage=1743.0,
+                                gas_charge=60.45,
+                                gas_usage=46.263,
+                            ),
+                            _pse_bill(
+                                "2026-06-05T00:00:00-07:00/2026-07-08T00:00:00-07:00",
+                                elec_charge=0.0,
+                                elec_usage=-123.0,
+                                gas_charge=32.31,
+                                gas_usage=24.281,
+                            ),
+                        ],
+                    }
+                }
+            }
+
+        monkeypatch.setattr(opower, "_async_get_dated_data", fake_get_dated_data)
+        monkeypatch.setattr(opower, "_async_post_graphql", fake_post_graphql)
+
+        result = await opower.async_get_cost_reads(account, AggregateType.BILL, None, None)
+
+        tz = ZoneInfo("America/Los_Angeles")
+        assert len(result) == 2
+        # Only the electric segment is kept; gas charges/usage are excluded.
+        assert result[0].provided_cost == 302.19
+        assert result[0].consumption == 1743.0
+        assert result[0].start_time == datetime(2025, 12, 6, tzinfo=tz)
+        assert result[0].end_time == datetime(2026, 1, 6, tzinfo=tz)
+        # Zero cost with negative net usage is retained (maps to return-to-grid).
+        assert result[1].provided_cost == 0.0
+        assert result[1].consumption == -123.0
+        # First attempt carries the explicit selectedAccount URN.
+        assert graphql_calls[0]["selectedAccount"] == "urn:opower:v0:multiCustomer:pse:uuids:customer-uuid"
+
+
+@pytest.mark.asyncio
+async def test_cost_reads_bill_graphql_retries_without_selected_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the query fails with an explicit selectedAccount, it retries without one."""
+    async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
+        opower = Opower(
+            session,
+            "Puget Sound Energy (PSE)",
+            username="test",
+            password="test",  # noqa: S106
+        )
+
+        account = Account(
+            customer=Customer(uuid="customer-uuid"),
+            uuid="elec-uuid",
+            utility_account_id="test-id",
+            id="test-id",
+            meter_type=MeterType.ELEC,
+            read_resolution=ReadResolution.BILLING,
+        )
+
+        async def fake_get_dated_data(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            return []
+
+        graphql_calls: list[dict[str, object]] = []
+
+        async def fake_post_graphql(
+            query: str,
+            headers: dict[str, str],
+            variables: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            graphql_calls.append(variables or {})
+            if "selectedAccount" in (variables or {}):
+                raise ApiException(message="GraphQL Error", url="http://example.com")
+            bill = _pse_bill(
+                "2025-12-06T00:00:00-08:00/2026-01-06T00:00:00-08:00",
+                elec_charge=302.19,
+                elec_usage=1743.0,
+                gas_charge=60.45,
+                gas_usage=46.263,
+            )
+            return {"data": {"billingAccountByAuthContext": {"bills": [bill]}}}
+
+        monkeypatch.setattr(opower, "_async_get_dated_data", fake_get_dated_data)
+        monkeypatch.setattr(opower, "_async_post_graphql", fake_post_graphql)
+
+        result = await opower.async_get_cost_reads(account, AggregateType.BILL, None, None)
+
+        assert len(graphql_calls) == 2
+        assert "selectedAccount" in graphql_calls[0]
+        assert "selectedAccount" not in graphql_calls[1]
+        assert len(result) == 1
+        assert result[0].provided_cost == 302.19
+
+
+@pytest.mark.asyncio
+async def test_cost_reads_bill_graphql_prefers_total_energy_costs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NEM-aware totalEnergyCosts field wins over usageCharges when the utility populates it."""
+    async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
+        opower = Opower(
+            session,
+            "Puget Sound Energy (PSE)",
+            username="test",
+            password="test",  # noqa: S106
+        )
+
+        account = Account(
+            customer=Customer(uuid="customer-uuid"),
+            uuid="elec-uuid",
+            utility_account_id="test-id",
+            id="test-id",
+            meter_type=MeterType.ELEC,
+            read_resolution=ReadResolution.BILLING,
+        )
+
+        async def fake_get_dated_data(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            return []
+
+        async def fake_post_graphql(
+            query: str,
+            headers: dict[str, str],
+            variables: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            bill = _pse_bill(
+                "2025-12-06T00:00:00-08:00/2026-01-06T00:00:00-08:00",
+                elec_charge=120.0,
+                elec_usage=800.0,
+                gas_charge=40.0,
+                gas_usage=30.0,
+                elec_total_energy_cost=-15.5,
+            )
+            return {"data": {"billingAccountByAuthContext": {"bills": [bill]}}}
+
+        monkeypatch.setattr(opower, "_async_get_dated_data", fake_get_dated_data)
+        monkeypatch.setattr(opower, "_async_post_graphql", fake_post_graphql)
+
+        result = await opower.async_get_cost_reads(account, AggregateType.BILL, None, None)
+
+        assert len(result) == 1
+        assert result[0].provided_cost == -15.5
+        assert result[0].consumption == 800.0
 
 
 @pytest.mark.asyncio
