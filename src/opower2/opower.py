@@ -261,13 +261,18 @@ def _graphql_bills_to_cost_reads(
 ) -> "list[CostRead]":
     """Merge WDB_GetCostUsageReadsForBills segments into sorted bill-level CostReads."""
     reads_by_start: dict[datetime, CostRead] = {}
-    for bill in billing_account.get("bills") or []:
+    bills = billing_account.get("bills") or []
+    seg_total = seg_matched = seg_in_window = 0
+    for bill in bills:
         for segment in bill.get("segments") or []:
+            seg_total += 1
             if not _graphql_segment_matches_account(segment, account):
                 continue
+            seg_matched += 1
             read = _graphql_bill_segment_read(bill, segment, tz, start, end)
             if read is None:
                 continue
+            seg_in_window += 1
             existing = reads_by_start.get(read.start_time)
             if existing is None:
                 reads_by_start[read.start_time] = read
@@ -276,6 +281,28 @@ def _graphql_bills_to_cost_reads(
                 existing.provided_cost += read.provided_cost
                 existing.end_time = max(existing.end_time, read.end_time)
     reads = [reads_by_start[key] for key in sorted(reads_by_start)]
+    _LOGGER.debug(
+        "GraphQL bill cost: account uuid=%s meter=%s; %d bills, %d segments "
+        "(%d matched account, %d in [%s, %s)); %d reads before trailing-zero strip; "
+        "first segment serviceAgreement sample: %s",
+        account.uuid,
+        account.meter_type.value,
+        len(bills),
+        seg_total,
+        seg_matched,
+        seg_in_window,
+        start.isoformat(),
+        end.isoformat(),
+        len(reads),
+        next(
+            (
+                seg.get("serviceAgreement")
+                for bill in bills
+                for seg in bill.get("segments") or []
+            ),
+            None,
+        ),
+    )
     # Remove trailing entries with no data (mirrors async_get_cost_reads).
     while reads:
         last = reads.pop()
@@ -788,10 +815,20 @@ class Opower:
         if result is None:
             return []
 
-        billing_account = result.get("data", {}).get("billingAccountByAuthContext")
+        data = result.get("data") if isinstance(result, dict) else None
+        _LOGGER.debug(
+            "GraphQL bill cost raw response: timeInterval=%s data keys=%s errors=%s",
+            base_variables["timeInterval"],
+            list(data) if isinstance(data, dict) else data,
+            result.get("errors") if isinstance(result, dict) else None,
+        )
+        billing_account = (data or {}).get("billingAccountByAuthContext")
         if isinstance(billing_account, list):
             billing_account = billing_account[0] if billing_account else None
         if not billing_account:
+            _LOGGER.debug(
+                "GraphQL bill cost: billingAccountByAuthContext is empty (%r)", billing_account
+            )
             return []
 
         return _graphql_bills_to_cost_reads(billing_account, account, tz, start, end)
