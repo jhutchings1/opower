@@ -1,6 +1,6 @@
 [project]
 name = "opower2"
-version = "0.20.2"
+version = "0.20.3"
 license = {text = "Apache-2.0"}
 authors = [
     { name="tronikos", email="tronikos@gmail.com" },

@@ -781,14 +781,14 @@ class Opower:
         tz = await aiozoneinfo.async_get_time_zone(self.utility.timezone())
         # The TimeInterval scalar rejects fractional seconds, so truncate.
         end = (end_date or datetime.now(tz)).replace(microsecond=0)
-        start = (start_date or (end - timedelta(days=365 * 12))).replace(microsecond=0)
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=tz)
         if end.tzinfo is None:
             end = end.replace(tzinfo=tz)
-        # Query the full available history regardless of start; a narrow window can
-        # return no bills. Results are filtered to [start, end) when building reads.
+        # Ignore the caller's lower bound: bills are coarse and lag by weeks, so a
+        # trailing window (e.g. "last 30 days" on an incremental refresh) usually
+        # contains no finalized bill. Return the full available bill history; the
+        # caller merges/dedupes it against the finer reads and existing statistics.
         query_start = (end - timedelta(days=365 * 12)).replace(microsecond=0)
+        start = query_start
 
         headers = self._get_headers(account.customer.uuid)
         selected_account = f"urn:opower:v0:multiCustomer:{self.utility.subdomain()}:uuids:{account.customer.uuid}"
